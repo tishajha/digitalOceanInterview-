@@ -78,6 +78,14 @@ def list_jobs() -> list[dict[str, Any]]:
     ]
 
 
+@app.get("/")
+def root():
+    return {
+        "message": "Async Job API is running",
+        "docs": "/docs",
+        "health": "/health"
+    }
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
