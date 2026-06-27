@@ -1,91 +1,81 @@
-from contextlib import asynccontextmanager
-from typing import Any
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from queue import Queue
+from threading import Thread, Lock
+from uuid import uuid4
+import time
 
-from fastapi import FastAPI, HTTPException, status
+app = FastAPI()
 
-from app.models import JobRequest
-from app.service import JobService
+job_queue = Queue()
+jobs = {}
+lock = Lock()
 
-service: JobService | None = None
+class JobRequest(BaseModel):
+    payload: dict
 
+def worker():
+    while True:
+        job_id = job_queue.get()
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global service
-    service = JobService()
-    yield
-    if service is not None:
-        service.shutdown()
+        with lock:
+            jobs[job_id]["status"] = "running"
 
+        try:
+            time.sleep(5)
 
-app = FastAPI(title="Job Queue API", lifespan=lifespan)
+            with lock:
+                jobs[job_id]["status"] = "completed"
+                jobs[job_id]["result"] = {
+                    "message": "Job processed successfully",
+                    "payload": jobs[job_id]["payload"]
+                }
 
+        except Exception as e:
+            with lock:
+                jobs[job_id]["status"] = "failed"
+                jobs[job_id]["error"] = str(e)
 
-def get_service() -> JobService:
-    global service
-    if service is None:
-        service = JobService()
-    return service
+        finally:
+            job_queue.task_done()
 
-
-@app.post("/jobs", status_code=status.HTTP_202_ACCEPTED)
-def create_job(payload: JobRequest) -> dict[str, Any]:
-    try:
-        job = get_service().submit_job(payload.payload)
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-    except Exception as exc:  # pragma: no cover - simple fallback
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="unexpected error") from exc
-
-    return {"job_id": job.job_id, "status": job.status}
-
-
-@app.get("/jobs/{job_id}")
-def get_job(job_id: str) -> dict[str, Any]:
-    try:
-        job = get_service().get_job(job_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    except Exception as exc:  # pragma: no cover - simple fallback
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="unexpected error") from exc
-
-    status_value = job.status.value if hasattr(job.status, "value") else job.status
-    return {
-        "job_id": job.job_id,
-        "status": status_value,
-        "result": job.result,
-        "error": job.error,
-        "attempts": job.attempts,
-    }
-
-
-@app.get("/jobs")
-def list_jobs() -> list[dict[str, Any]]:
-    try:
-        jobs = get_service().list_jobs()
-    except Exception as exc:  # pragma: no cover - simple fallback
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="unexpected error") from exc
-
-    return [
-        {
-            "job_id": job.job_id,
-            "status": job.status.value if hasattr(job.status, "value") else job.status,
-            "result": job.result,
-            "error": job.error,
-            "attempts": job.attempts,
-        }
-        for job in jobs
-    ]
-
+Thread(target=worker, daemon=True).start()
 
 @app.get("/")
 def root():
-    return {
-        "message": "Async Job API is running",
-        "docs": "/docs",
-        "health": "/health"
-    }
+    return {"message": "Async Job API is running"}
 
 @app.get("/health")
-def health() -> dict[str, str]:
+def health():
     return {"status": "ok"}
+
+@app.post("/jobs")
+def create_job(request: JobRequest):
+    job_id = str(uuid4())
+
+    with lock:
+        jobs[job_id] = {
+            "job_id": job_id,
+            "status": "queued",
+            "payload": request.payload,
+            "result": None
+        }
+
+    job_queue.put(job_id)
+
+    return {
+        "job_id": job_id,
+        "status": "queued"
+    }
+
+@app.get("/jobs")
+def list_jobs():
+    with lock:
+        return list(jobs.values())
+
+@app.get("/jobs/{job_id}")
+def get_job(job_id: str):
+    with lock:
+        if job_id not in jobs:
+            raise HTTPException(status_code=404, detail=f"job not found: {job_id}")
+        return jobs[job_id]
